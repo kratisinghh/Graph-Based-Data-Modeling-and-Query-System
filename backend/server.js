@@ -23,8 +23,8 @@ const DB_PATH = path.join(__dirname, "business.db");
 // Auto-create DB if missing
 if (!fs.existsSync(DB_PATH)) {
   console.log("📦 Database not found. Running ingestion script...");
-  require("./scripts/import_jsonl_to_sqlite");
   require("./scripts/downloadDataSet");
+  require("./scripts/import_jsonl_to_sqlite");
 }
 
 const db = new sqlite3.Database(DB_PATH);
