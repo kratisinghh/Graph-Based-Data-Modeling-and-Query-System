@@ -24,6 +24,7 @@ const DB_PATH = path.join(__dirname, "business.db");
 if (!fs.existsSync(DB_PATH)) {
   console.log("📦 Database not found. Running ingestion script...");
   require("./scripts/import_jsonl_to_sqlite");
+  require("./scripts/downloadDataSet");
 }
 
 const db = new sqlite3.Database(DB_PATH);
