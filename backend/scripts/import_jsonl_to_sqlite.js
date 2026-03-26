@@ -5,60 +5,137 @@ const sqlite3 = require('sqlite3').verbose();
 
 const DATA_ROOT = path.join(__dirname, '../sap-o2c-data');
 const DB_PATH = path.join(__dirname, '../business.db');
+
 const db = new sqlite3.Database(DB_PATH);
 
-async function processFile(filePath, tableName) {
-    console.log(`📖 Attempting to read: ${tableName} (${path.basename(filePath)})`);
-    const fileStream = fs.createReadStream(filePath);
-    const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+// Track initialized tables
+const initializedTables = new Set();
 
-    let isFirstLine = true;
+// Promisified SQL runner
+function runSql(sql, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(sql, params, function (err) {
+            if (err) reject(err);
+            else resolve(this);
+        });
+    });
+}
+
+// Process one JSONL file
+async function processFile(filePath, tableName) {
+    console.log(`📖 Processing: ${tableName} → ${path.basename(filePath)}`);
+
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+    });
+
+    let headers = null;
     let stmt = null;
-    let headers = [];
+    let inserted = 0;
 
     for await (const line of rl) {
         if (!line.trim()) continue;
+
         let row;
         try {
             row = JSON.parse(line);
-        } catch (e) { continue; }
-        
-        if (isFirstLine) {
+        } catch {
+            continue;
+        }
+
+        // First row determines schema
+        if (!headers) {
             headers = Object.keys(row);
-            const cols = headers.map(k => `"${k}" TEXT`).join(', ');
-            await new Promise((res) => {
-                db.serialize(() => {
-                    db.run(`DROP TABLE IF EXISTS "${tableName}"`);
-                    db.run(`CREATE TABLE "${tableName}" (${cols})`, () => res());
-                });
-            });
-            stmt = db.prepare(`INSERT INTO "${tableName}" VALUES (${headers.map(() => '?').join(',')})`);
-            isFirstLine = false;
+
+            // Create table ONLY once
+            if (!initializedTables.has(tableName)) {
+                const columns = headers
+                    .map(col => `"${col}" TEXT`)
+                    .join(", ");
+
+                await runSql(
+                    `CREATE TABLE IF NOT EXISTS "${tableName}" (${columns})`
+                );
+
+                initializedTables.add(tableName);
+                console.log(`✅ Table ready: ${tableName}`);
+            }
+
+            // Prepare insert statement once per file
+            const placeholders = headers.map(() => "?").join(",");
+            stmt = db.prepare(
+                `INSERT INTO "${tableName}" VALUES (${placeholders})`
+            );
         }
-        stmt.run(headers.map(h => typeof row[h] === 'object' ? JSON.stringify(row[h]) : String(row[h] ?? "")));
+
+        const values = headers.map(h =>
+            typeof row[h] === "object"
+                ? JSON.stringify(row[h])
+                : String(row[h] ?? "")
+        );
+
+        stmt.run(values);
+        inserted++;
+
+        // Progress log every 10k rows
+        if (inserted % 10 === 0) {
+            console.log(`   ↳ ${inserted} rows inserted into ${tableName}`);
+        }
     }
-    if (stmt) {
-        stmt.finalize();
-        console.log(`✅ Table Populated: ${tableName}`);
-    }
+
+    if (stmt) stmt.finalize();
+
+    console.log(`📦 Finished ${tableName}: ${inserted} rows`);
 }
 
-function walk(dir) {
-    const items = fs.readdirSync(dir);
-    for (const item of items) {
-        const fullPath = path.join(dir, item);
+
+// Walk dataset directory recursively
+async function walk(dir) {
+    const files = fs.readdirSync(dir);
+
+    for (const file of files) {
+        const fullPath = path.join(dir, file);
         const stat = fs.statSync(fullPath);
-        
+
         if (stat.isDirectory()) {
-            walk(fullPath); 
-        } else if (!item.startsWith('.')) { // Process any file that isn't a hidden system file
+            await walk(fullPath);
+        } else if (!file.startsWith(".")) {
             const parentDir = path.basename(path.dirname(fullPath));
-            const tableName = parentDir.replace(/[^a-z0-9]/gi, '_');
-            processFile(fullPath, tableName);
+
+            // Convert folder name → table name
+            const tableName = parentDir.replace(/[^a-z0-9]/gi, "_");
+
+            await processFile(fullPath, tableName);
         }
     }
 }
 
-console.log("🚀 Starting Brute Force Ingestion...");
-if (fs.existsSync(DATA_ROOT)) walk(DATA_ROOT);
-else console.error("❌ Folder not found!");
+
+// Main execution
+(async () => {
+    console.log("🚀 Starting dataset ingestion...");
+
+    if (!fs.existsSync(DATA_ROOT)) {
+        console.error("❌ Dataset folder not found:", DATA_ROOT);
+        process.exit(1);
+    }
+
+    try {
+        await runSql("BEGIN TRANSACTION");
+
+        await walk(DATA_ROOT);
+
+        await runSql("COMMIT");
+
+        console.log("🎉 All data ingested successfully!");
+    } catch (err) {
+        console.error("❌ Error during ingestion:", err);
+        await runSql("ROLLBACK");
+    } finally {
+        db.close(() => {
+            console.log("💾 SQLite connection closed.");
+        });
+    }
+})();
