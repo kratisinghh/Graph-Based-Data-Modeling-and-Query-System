@@ -1,173 +1,319 @@
-require('dotenv').config();
-const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
-const cors = require('cors');
+require("dotenv").config();
+
+const express = require("express");
+const sqlite3 = require("sqlite3").verbose();
+const cors = require("cors");
+const path = require("path");
+const fs = require("fs");
+
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const db = new sqlite3.Database('./business.db');
+/*
+========================================
+DATABASE INITIALIZATION (DEPLOYMENT SAFE)
+========================================
+*/
+
+const DB_PATH = path.join(__dirname, "business.db");
+
+// Auto-create DB if missing
+if (!fs.existsSync(DB_PATH)) {
+  console.log("📦 Database not found. Running ingestion script...");
+  require("./scripts/import_jsonl_to_sqlite");
+}
+
+const db = new sqlite3.Database(DB_PATH);
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+/*
+========================================
+SCHEMA CACHE FOR PROMPT INJECTION
+========================================
+*/
+
 let cachedSchema = "";
-db.all("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], (err, rows) => {
-    if (!err && rows) cachedSchema = rows.map(r => r.sql).join('\n');
-});
+
+db.all(
+  "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+  [],
+  (err, rows) => {
+    if (!err && rows) {
+      cachedSchema = rows.map((r) => r.sql).join("\n");
+      console.log("✅ Schema cached successfully");
+    }
+  }
+);
 
 const getDatabaseSchema = async () => {
-    if (cachedSchema) return cachedSchema;
-    return new Promise((resolve) => {
-        db.all("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], (err, rows) => {
-            cachedSchema = rows ? rows.map(r => r.sql).join('\n') : "";
-            resolve(cachedSchema);
-        });
-    });
+  if (cachedSchema) return cachedSchema;
+
+  return new Promise((resolve) => {
+    db.all(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+      [],
+      (err, rows) => {
+        cachedSchema = rows ? rows.map((r) => r.sql).join("\n") : "";
+        resolve(cachedSchema);
+      }
+    );
+  });
 };
 
-app.post('/api/query', async (req, res) => {
-    const { prompt } = req.body;
+/*
+========================================
+SAFE SQL EXECUTION WRAPPER
+========================================
+*/
+
+const executeQuery = (sql) =>
+  new Promise((resolve) => {
+    db.all(sql, [], (err, rows) => {
+      if (err) {
+        console.error("❌ SQL Error:", err.message);
+        console.error("SQL:", sql);
+        return resolve([]);
+      }
+      resolve(rows || []);
+    });
+  });
+
+/*
+========================================
+MAIN QUERY ENDPOINT
+========================================
+*/
+
+app.post("/api/query", async (req, res) => {
+  const { prompt } = req.body;
+
+  try {
+    const schema = await getDatabaseSchema();
+
+    const model = genAI.getGenerativeModel({
+      model: "gemini-flash-latest",
+      systemInstruction: `
+You are an expert SAP Order-to-Cash data assistant.
+
+Database Schema:
+${schema}
+
+Task:
+1. Determine whether the question relates to the dataset.
+2. If not relevant → return isRelevant = false
+3. If relevant → generate:
+
+answerSql → for textual answer
+graphSql → for lifecycle relationship graph
+
+Respond ONLY in JSON format:
+
+{
+  "isRelevant": boolean,
+  "answerSql": "string",
+  "graphSql": "string",
+  "guardrailMessage": "string"
+}
+`,
+    });
+
+    const result = await model.generateContent(prompt);
+
+    let text = result.response
+      .text()
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+    console.log("🤖 Gemini Config:", text);
+
+    let config;
+
     try {
-        const schema = await getDatabaseSchema();
-        const model = genAI.getGenerativeModel({ 
-            model: "gemini-flash-latest",
-            systemInstruction: `You are an expert SAP O2C data assistant. 
-            Schema: ${schema}
-            
-            Task:
-            1. Determine if the question is about the dataset.
-            2. If not, set isRelevant to false.
-            3. If yes, generate TWO SQLite queries: 
-               - 'answerSql': To get the data for the text answer.
-               - 'graphSql': To get the interconnected flow (SalesOrder -> Delivery -> Billing -> Journal).
-            
-            Respond ONLY in JSON:
-            {
-              "isRelevant": boolean,
-              "answerSql": "string",
-              "graphSql": "string",
-              "guardrailMessage": "string (only if irrelevant)"
-            }`
-        });
-
-        const result = await model.generateContent(prompt);
-        let text = result.response.text();
-        // Remove potential markdown code blocks
-        text = text.replace(/```json/g, "").replace(/```/g, "").trim();
-        
-        console.log("🤖 Gemini Config Response:", text);
-        const config = JSON.parse(text);
-
-        if (!config.isRelevant) {
-            return res.json({ answer: config.guardrailMessage || "This system is designed to answer questions related to the provided dataset only.", data: null });
-        }
-
-        console.log("🚀 Executing Answer SQL:", config.answerSql);
-        console.log("🚀 Executing Graph SQL:", config.graphSql);
-
-        // Execute both queries
-        const executeQuery = (sql) => new Promise((resolve, reject) => {
-            db.all(sql, [], (err, rows) => {
-                if (err) {
-                    console.error("❌ SQL Error:", err.message, "SQL:", sql);
-                    resolve([]); // Resolve with empty to avoid crashing, but log it
-                } else {
-                    resolve(rows || []);
-                }
-            });
-        });
-        
-        const [answerData, graphRawData] = await Promise.all([
-            executeQuery(config.answerSql),
-            executeQuery(config.graphSql)
-        ]);
-
-        // Final step: Generate the natural language answer and the graph structure in ONE go
-        const finalModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-        const finalPrompt = `User Question: ${prompt}
-        Data for Answer: ${JSON.stringify(answerData).substring(0, 5000)}
-        Data for Graph: ${JSON.stringify(graphRawData).substring(0, 5000)}
-        
-        Respond ONLY in JSON format:
-        {
-          "answer": "Clear natural language answer",
-          "graph": {
-            "nodes": [{"id": "string", "label": "string", "type": "string"}],
-            "links": [{"source": "id", "target": "id", "label": "string"}]
-          }
-        }`;
-
-        const finalResult = await finalModel.generateContent(finalPrompt);
-        let finalText = finalResult.response.text();
-        finalText = finalText.replace(/```json/g, "").replace(/```/g, "").trim();
-        
-        console.log("🤖 Gemini Final Response:", finalText);
-        const finalOutput = JSON.parse(finalText);
-
-
-        res.json({
-            answer: finalOutput.answer,
-            graph: finalOutput.graph,
-            query: config.answerSql
-        });
-
-    } catch (error) {
-        console.error("Error:", error);
-        if (error.message.includes("429")) {
-            res.status(429).json({ error: "API Quota Exceeded. Please try again in a few minutes." });
-        } else {
-            res.status(500).json({ error: "Internal server error" });
-        }
+      config = JSON.parse(text);
+    } catch {
+      return res.status(500).json({
+        error: "Failed to parse Gemini SQL response",
+      });
     }
+
+    if (!config.isRelevant) {
+      return res.json({
+        answer:
+          config.guardrailMessage ||
+          "This system answers SAP O2C dataset queries only.",
+        data: null,
+      });
+    }
+
+    console.log("🚀 Running Answer SQL:", config.answerSql);
+    console.log("🚀 Running Graph SQL:", config.graphSql);
+
+    const [answerData, graphRawData] = await Promise.all([
+      executeQuery(config.answerSql),
+      executeQuery(config.graphSql),
+    ]);
+
+    /*
+    ========================================
+    FINAL RESPONSE GENERATION (NLG + GRAPH)
+    ========================================
+    */
+
+    const finalModel = genAI.getGenerativeModel({
+      model: "gemini-flash-latest",
+    });
+
+    const finalPrompt = `
+User Question:
+${prompt}
+
+Answer Data:
+${JSON.stringify(answerData).slice(0, 5000)}
+
+Graph Data:
+${JSON.stringify(graphRawData).slice(0, 5000)}
+
+Respond ONLY in JSON format:
+
+{
+  "answer": "clear natural language explanation",
+  "graph": {
+    "nodes": [{"id": "string", "label": "string", "type": "string"}],
+    "links": [{"source": "id", "target": "id", "label": "string"}]
+  }
+}
+`;
+
+    const finalResult = await finalModel.generateContent(finalPrompt);
+
+    let finalText = finalResult.response
+      .text()
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+
+    console.log("🤖 Gemini Final:", finalText);
+
+    let finalOutput;
+
+    try {
+      finalOutput = JSON.parse(finalText);
+    } catch {
+      return res.status(500).json({
+        error: "Failed to parse Gemini graph response",
+      });
+    }
+
+    res.json({
+      answer: finalOutput.answer,
+      graph: finalOutput.graph,
+      query: config.answerSql,
+    });
+  } catch (error) {
+    console.error("❌ ERROR:", error);
+
+    if (error.message.includes("429")) {
+      return res.status(429).json({
+        error: "Gemini quota exceeded. Try again shortly.",
+      });
+    }
+
+    res.status(500).json({
+      error: "Internal server error",
+    });
+  }
 });
 
-app.post('/api/expand', async (req, res) => {
-    const { nodeId, nodeType } = req.body;
-    try {
-        const schema = await getDatabaseSchema();
-        const model = genAI.getGenerativeModel({ 
-            model: "gemini-flash-latest",
-            systemInstruction: `You are an expert SAP O2C data assistant. 
-            Schema: ${schema}
-            
-            Task:
-            Given a specific Node (ID: ${nodeId}, Type: ${nodeType}), generate a SQLite query to find all directly connected entities (1-step neighbors) in the O2C flow.
-            
-            Respond ONLY in JSON:
-            {
-              "sql": "string",
-              "explanation": "string (why these are connected)"
-            }`
-        });
+/*
+========================================
+GRAPH EXPANSION ENDPOINT
+========================================
+*/
 
-        const result = await model.generateContent(`Find all connected entities for ${nodeType} ${nodeId}`);
-        const config = JSON.parse(result.response.text().replace(/```json/g, "").replace(/```/g, "").trim());
+app.post("/api/expand", async (req, res) => {
+  const { nodeId, nodeType } = req.body;
 
-        db.all(config.sql, [], async (err, rows) => {
-            if (err) return res.status(500).json({ error: err.message });
+  try {
+    const schema = await getDatabaseSchema();
 
-            const finalModel = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-            const finalPrompt = `Convert these connected database rows into a JSON graph.
-            Target Node: ${nodeType} ${nodeId}
-            Rows: ${JSON.stringify(rows).substring(0, 5000)}
-            
-            Respond ONLY in JSON:
-            {
-              "nodes": [{"id": "string", "label": "string", "type": "string"}],
-              "links": [{"source": "id", "target": "id", "label": "string"}]
-            }`;
+    const model = genAI.getGenerativeModel({
+      model: "gemini-flash-latest",
+      systemInstruction: `
+You are an SAP O2C assistant.
 
-            const finalResult = await finalModel.generateContent(finalPrompt);
-            const finalOutput = JSON.parse(finalResult.response.text().replace(/```json/g, "").replace(/```/g, "").trim());
-            res.json(finalOutput);
-        });
+Schema:
+${schema}
 
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
+Task:
+Given node ID ${nodeId} of type ${nodeType},
+generate SQL to retrieve directly connected entities.
+
+Respond ONLY in JSON:
+
+{
+  "sql": "string"
+}
+`,
+    });
+
+    const result = await model.generateContent(
+      `Expand neighbors for ${nodeType} ${nodeId}`
+    );
+
+    let config = JSON.parse(
+      result.response.text().replace(/```json/g, "").replace(/```/g, "")
+    );
+
+    const rows = await executeQuery(config.sql);
+
+    const finalModel = genAI.getGenerativeModel({
+      model: "gemini-flash-latest",
+    });
+
+    const finalPrompt = `
+Convert rows into graph JSON.
+
+Target Node:
+${nodeType} ${nodeId}
+
+Rows:
+${JSON.stringify(rows).slice(0, 5000)}
+
+Return ONLY JSON:
+
+{
+  "nodes": [{"id": "string", "label": "string", "type": "string"}],
+  "links": [{"source": "id", "target": "id", "label": "string"}]
+}
+`;
+
+    const finalResult = await finalModel.generateContent(finalPrompt);
+
+    const finalOutput = JSON.parse(
+      finalResult.response.text().replace(/```json/g, "").replace(/```/g, "")
+    );
+
+    res.json(finalOutput);
+  } catch (error) {
+    res.status(500).json({
+      error: error.message,
+    });
+  }
 });
+
+/*
+========================================
+SERVER START
+========================================
+*/
 
 const PORT = process.env.PORT || 5001;
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Optimized Backend running on http://127.0.0.1:${PORT}`));
 
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`🚀 Backend running on http://127.0.0.1:${PORT}`)
+);
