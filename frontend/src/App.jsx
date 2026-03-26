@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 
-const API_BASE = 'http://127.0.0.1:5001/api';
+const API_BASE = 'https://graph-based-data-modeling-and-query-85ih.onrender.com/api';
 
 export default function App() {
   const [prompt, setPrompt] = useState('');
