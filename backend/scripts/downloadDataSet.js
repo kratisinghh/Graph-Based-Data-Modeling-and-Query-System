@@ -1,25 +1,25 @@
-const { execSync } = require("child_process");
 const fs = require("fs");
-const path = require("path");
+const { execSync } = require("child_process");
 
-const DATASET_URL =
-  "https://drive.google.com/uc?id=1UqaLbFaveV-3MEuiUrzKydhKmkeC1iAL";
+const FILE_ID = "1UqaLbFaveV-3MEuiUrzKydhKmkeC1iAL";
 
-const DATA_DIR = path.join(__dirname, "../sap-o2c-data");
+try {
+  if (!fs.existsSync("sap-o2c-data")) {
+    console.log("📥 Downloading dataset from Google Drive...");
 
-if (!fs.existsSync(DATA_DIR)) {
-  console.log("📥 Downloading dataset...");
+    execSync(
+      `curl -L -o dataset.zip "https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t"`,
+      { stdio: "inherit" }
+    );
 
-  execSync(
-    `npx gdown ${DATASET_URL} -O dataset.zip`,
-    { stdio: "inherit" }
-  );
+    console.log("📦 Extracting dataset...");
+    execSync("unzip dataset.zip -d sap-o2c-data", { stdio: "inherit" });
 
-  execSync("unzip dataset.zip -d sap-o2c-data", {
-    stdio: "inherit"
-  });
-
-  console.log("✅ Dataset downloaded");
-} else {
-  console.log("📂 Dataset already exists");
+    console.log("✅ Dataset ready");
+  } else {
+    console.log("📁 Dataset already exists");
+  }
+} catch (err) {
+  console.error("❌ Dataset download failed:", err.message);
+  process.exit(1);
 }
